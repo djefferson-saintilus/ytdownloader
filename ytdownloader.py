@@ -6,20 +6,34 @@ import queue
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from tkinterdnd2 import DND_FILES, TkinterDnD
-from moviepy.editor import AudioFileClip
 import tkinter.ttk as ttk
 import tkinter.font as tkfont
 
+# Safe import of AudioFileClip with fallback
+try:
+    from moviepy.editor import AudioFileClip
+except ImportError:
+    AudioFileClip = None
+
 def sanitize_filename(name):
-    return "".join(c for c in name if c.isalnum() or c in (' ', '_', '-')).rstrip()
+    # Keep alphanumeric, spaces, underscores, dashes, dots (for extensions)
+    sanitized = re.sub(r'[^a-zA-Z0-9 _\-.]', '', name).strip()
+    # Avoid filenames with only dots or empty names
+    if not sanitized or all(c == '.' for c in sanitized):
+        sanitized = "audio_file"
+    return sanitized
 
 def is_valid_youtube_url(url):
+    # Stricter validation for YouTube video URLs of length exactly 11 chars in video id
     pattern = re.compile(
-        r'^(https?://)?(www\.)?(youtube\.com/watch\?v=|youtu\.be/)[\w\-]{11}(&.*)?$'
+        r'^(https?://)?(www\.)?(youtube\.com/watch\?v=|youtu\.be/)([\w\-]{11})([&?].*)?$'
     )
     return bool(pattern.match(url))
 
 def convert_to_mp3(video_path, output_folder, title, progress_queue, progress_bar):
+    if AudioFileClip is None:
+        progress_queue.put("❌ moviepy is not installed or failed to import; cannot convert audio.")
+        return
     try:
         base_title = sanitize_filename(title)
         mp3_filename = base_title + ".mp3"
@@ -30,7 +44,7 @@ def convert_to_mp3(video_path, output_folder, title, progress_queue, progress_ba
         progress_bar.start(10)
 
         audio = AudioFileClip(video_path)
-        audio.write_audiofile(mp3_path)
+        audio.write_audiofile(mp3_path, logger=None)
         audio.close()
 
         os.remove(video_path)
@@ -76,15 +90,32 @@ def download_youtube_audio(url, output_folder, progress_queue, progress_bar):
         return False
 
 def find_latest_file(folder):
+    # Include more audio extensions for better detection
+    valid_extensions = ('.webm', '.m4a', '.mp4')
     files = [os.path.join(folder, f) for f in os.listdir(folder)]
-    files = [f for f in files if os.path.isfile(f) and f.lower().endswith(('.webm', '.m4a'))]
-    return max(files, key=os.path.getctime) if files else None
+    files = [f for f in files if os.path.isfile(f) and f.lower().endswith(valid_extensions)]
+    if not files:
+        return None
+    return max(files, key=os.path.getctime)
 
 def worker_thread(url, output_folder, progress_queue, progress_bar):
+    # Ensure output folder exists and is writable
+    if not os.path.exists(output_folder):
+        try:
+            os.makedirs(output_folder, exist_ok=True)
+            progress_queue.put(f"Created output folder: {output_folder}")
+        except Exception as e:
+            progress_queue.put(f"❌ Failed to create output folder: {e}")
+            return
+    elif not os.access(output_folder, os.W_OK):
+        progress_queue.put("❌ Output folder is not writable.")
+        return
+
     success = download_youtube_audio(url, output_folder, progress_queue, progress_bar)
     if not success:
         progress_queue.put("❌ Download failed. Operation aborted.")
         return
+
     latest_file = find_latest_file(output_folder)
     if latest_file:
         title = os.path.splitext(os.path.basename(latest_file))[0]
@@ -100,8 +131,11 @@ def start_download_thread(url, output_folder):
         messagebox.showerror("Invalid URL", "The URL provided is not a valid YouTube video link.")
         return
     if not os.path.isdir(output_folder):
-        messagebox.showwarning("Folder Error", "The selected folder does not exist.")
-        return
+        try:
+            os.makedirs(output_folder, exist_ok=True)
+        except Exception as e:
+            messagebox.showerror("Folder Error", f"Cannot create output folder:\n{e}")
+            return
 
     download_btn.config(state="disabled")
     url_entry.config(state="disabled")
@@ -115,6 +149,7 @@ def start_download_thread(url, output_folder):
     root.after(100, process_queue)
 
 def process_queue():
+    MAX_LOG_LINES = 300  # Limit number of log lines to keep in status box
     try:
         while True:
             msg = progress_queue.get_nowait()
@@ -122,6 +157,10 @@ def process_queue():
                 progress_bar['value'] = msg[1]
             else:
                 status_box.insert(tk.END, msg + "\n")
+                # Keep log from growing indefinitely
+                lines = status_box.get('1.0', tk.END).splitlines()
+                if len(lines) > MAX_LOG_LINES:
+                    status_box.delete('1.0', f'{len(lines) - MAX_LOG_LINES + 1}.0')
                 status_box.see(tk.END)
     except queue.Empty:
         pass
@@ -151,13 +190,25 @@ def on_drop(event):
     url_entry.delete(0, tk.END)
     url_entry.insert(0, url)
 
+def on_close():
+    # Optionally ask if user wants to abort ongoing download/conversion threads
+    if threading.active_count() > 1:
+        if messagebox.askyesno("Exit", "A process is running. Exit anyway?"):
+            root.destroy()
+    else:
+        root.destroy()
+
 
 # ---------- UI SETUP ----------
 root = TkinterDnD.Tk()
 root.title("YouTube to MP3 Converter")
-root.iconbitmap("icon.ico")  # Ensure icon.ico exists
+try:
+    root.iconbitmap("icon.ico")  # Ensure icon.ico exists or remove this line
+except Exception:
+    pass
 root.geometry("600x500")
 root.resizable(False, False)
+root.protocol("WM_DELETE_WINDOW", on_close)
 
 # ---- Styling Section ----
 style = ttk.Style(root)
